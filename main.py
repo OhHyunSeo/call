@@ -19,6 +19,9 @@ from src.text.utils import Annotator
 from src.text.llm import LLMOrchestrator, LLMResultHandler
 from src.utils.utils import Cleaner, Watcher
 from src.db.manager import Database
+from watchdog.events import FileSystemEventHandler
+import asyncio
+from watchdog.observers.polling import PollingObserver
 
 
 async def main(audio_file_path: str):
@@ -288,5 +291,36 @@ async def process(path: str):
 
 
 if __name__ == "__main__":
-    directory_to_watch = ".data/input"
-    Watcher.start_watcher(directory_to_watch, process)
+    # 1) 감시할 디렉터리 절대경로 계산 & 생성
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    watch_dir = os.path.join(BASE_DIR, ".data", "input")
+    os.makedirs(watch_dir, exist_ok=True)
+    print(f"→ Watching for new files in: {watch_dir}")
+
+    # 2) 파일 생성·이동 이벤트 처리 핸들러
+    class FileHandler(FileSystemEventHandler):
+        def __init__(self, callback):
+            super().__init__()
+            self.callback = callback
+
+        def on_created(self, event):
+            if not event.is_directory:
+                print(f"[Watcher] created: {event.src_path}")
+                asyncio.run(self.callback(event.src_path))
+
+        def on_moved(self, event):
+            if not event.is_directory:
+                print(f"[Watcher] moved: {event.dest_path}")
+                asyncio.run(self.callback(event.dest_path))
+
+    # 3) Observer 설정 및 실행
+    observer = PollingObserver()
+    observer.schedule(FileHandler(process), watch_dir, recursive=False)
+    observer.start()
+    try:
+        import time
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        observer.stop()
+    observer.join()

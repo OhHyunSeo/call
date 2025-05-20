@@ -3,7 +3,6 @@ nltk==3.9.1
 faster-whisper==1.1.0
 demucs==4.0.1
 deepmultilingualpunctuation @ git+https://github.com/oliverguhr/deepmultilingualpunctuation.git@5a0dd7f4fd56687f59405aa8eba1144393d8b74b
-ctc-forced-aligner @ git+https://github.com/MahmoudAshraf97/ctc-forced-aligner.git@c7cc7ce609e5f8f1f553fbd1e53124447ffe46d8
 openai==1.57.0
 accelerate>=0.26.0
 torch==2.5.1
@@ -21,3 +20,8 @@ scipy==1.14.1
 IPython==8.30.0
 pyyaml==6.0.2
 MPSENet==1.0.3
+wget
+treetable
+ctc-forced-aligner @ git+https://github.com/MahmoudAshraf97/ctc-forced-aligner.git@c7cc7ce609e5f8f1f553fbd1e53124447ffe46d8
+transformers
+gradio

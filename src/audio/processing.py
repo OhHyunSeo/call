@@ -512,8 +512,16 @@ class PunctuationRestorer:
         self.language = language
         self.punct_model = PunctuationModel(model="kredor/punctuate-all")
         self.supported_languages = [
-            "en", "fr", "de", "es", "it", "nl", "pt", "bg", "pl", "cs", "sk", "sl",
+            "en", "fr", "de", "es", "it", "nl", "pt", "bg", "pl", "cs", "sk", "sl", "ko"
         ]
+        # 한국어 구두점 규칙
+        self.korean_punct_rules = {
+            "sentence_end": ".!?",
+            "pause": ",;:",
+            "quotation": "\"'",
+            "brackets": "()[]{}",
+            "special": "-~…"
+        }
 
     def restore_punctuation(
             self, word_speaker_mapping: Annotated[List[Dict], "List of word-speaker mappings"]
@@ -545,6 +553,9 @@ class PunctuationRestorer:
             print(f"Punctuation restoration is not available for {self.language} language.")
             return word_speaker_mapping
 
+        if self.language == "ko":
+            return self._restore_korean_punctuation(word_speaker_mapping)
+
         words_list = [word_dict["text"] for word_dict in word_speaker_mapping]
         labeled_words = self.punct_model.predict(words_list)
 
@@ -562,6 +573,74 @@ class PunctuationRestorer:
                 word += labeled_tuple[1]
                 word = word.rstrip(".") if word.endswith("..") else word
                 word_dict["text"] = word
+
+        return word_speaker_mapping
+
+    def _restore_korean_punctuation(
+            self, word_speaker_mapping: Annotated[List[Dict], "List of word-speaker mappings"]
+    ) -> Annotated[List[Dict], "Word mappings with restored Korean punctuation"]:
+        """
+        한국어 구두점 복원을 위한 메서드
+
+        Parameters
+        ----------
+        word_speaker_mapping : List[Dict]
+            단어와 화자 매핑 정보가 담긴 리스트
+
+        Returns
+        -------
+        List[Dict]
+            구두점이 복원된 단어 매핑 리스트
+        """
+        sentence_end_patterns = [
+            r'다\.$', r'까\?$', r'요\.$', r'니다\.$', r'습니다\.$',
+            r'어요\.$', r'아요\.$', r'네요\.$', r'군요\.$', r'죠\.$',
+            r'다!$', r'요!$', r'니다!$', r'습니다!$', r'어요!$',
+            r'아요!$', r'네요!$', r'군요!$', r'죠!$',
+            r'지\.$', r'잖아\.$', r'잖아요\.$', r'네\.$', r'네\?$', r'어\.$',
+            r'겠어요\?$', r'겠습니까\?$', r'겠네요\?$', r'겠죠\?$', 
+            r'다구요\.$', r'라면서\.$', r'라지요\?$', r'라네요\.$'
+        ]
+
+        pause_patterns = [
+            r'그리고$', r'그래서$', r'하지만$', r'그러나$', r'그런데$',
+            r'왜냐하면$', r'때문에$', r'대해서$', r'위해서$', r'관해서$',
+            r'또한$', r'게다가$', r'더구나$', r'더불어$', r'한편$', 
+            r'반면$', r'오히려$', r'사실$', r'즉$', r'다만$', r'어쨌든$',
+            r'예를 들어$', r'예컨대$', r'간단히 말해$', r'특히$', r'무엇보다$',
+            # 구어체 전환 어미
+            r'ㄴ데요$', r'긴 한데$', r'말이에요$', r'말이야$',
+            # 부연 설명 전환
+            r'다시 말해$', r'바꾸어 말하면$', r'한마디로$', r'결국$'
+        ]
+
+
+        for i, word_dict in enumerate(word_speaker_mapping):
+            word = word_dict["text"]
+            
+            # 문장 종결 구두점 추가
+            if any(re.search(pattern, word) for pattern in sentence_end_patterns):
+                if not any(word.endswith(p) for p in self.korean_punct_rules["sentence_end"]):
+                    word += "."
+            
+            # 문장 중간 구두점 추가
+            elif any(re.search(pattern, word) for pattern in pause_patterns):
+                if not any(word.endswith(p) for p in self.korean_punct_rules["pause"]):
+                    word += ","
+            
+            # 다음 단어가 있는 경우 연결 관계 확인
+            if i < len(word_speaker_mapping) - 1:
+                next_word = word_speaker_mapping[i + 1]["text"]
+                # 인용구 시작/종료 확인
+                if word.startswith(('"', "'")) and not word.endswith(('"', "'")):
+                    if not next_word.endswith(('"', "'")):
+                        word_speaker_mapping[i + 1]["text"] = next_word + '"'
+                # 괄호 짝 맞추기
+                if word.startswith(('(', '[', '{')) and not word.endswith((')', ']', '}')):
+                    if not next_word.endswith((')', ']', '}')):
+                        word_speaker_mapping[i + 1]["text"] = next_word + ')'
+
+            word_dict["text"] = word
 
         return word_speaker_mapping
 

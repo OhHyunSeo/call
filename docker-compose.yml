@@ -1,0 +1,17 @@
+services:
+  callytics:
+    build:
+      context: .
+      args:
+        HUGGINGFACE_TOKEN: ${HUGGINGFACE_TOKEN}
+    container_name: callytics_app
+    volumes:
+      - .:/app
+    ports:
+      - "8501:7860"
+    env_file:
+      - .env
+    environment:
+      - HUGGINGFACE_TOKEN=${HUGGINGFACE_TOKEN}
+    stdin_open: true
+    tty: true
