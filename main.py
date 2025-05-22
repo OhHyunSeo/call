@@ -1,9 +1,15 @@
 # Standard library imports
 import os
+import asyncio
+import argparse
+import logging
+from typing import List
 
 # Related third-party imports
 from omegaconf import OmegaConf
 from nemo.collections.asr.models.msdd_models import NeuralDiarizer
+from watchdog.observers.polling import PollingObserver
+from watchdog.events import FileSystemEventHandler
 
 # Local imports
 from src.audio.utils import Formatter
@@ -19,308 +25,195 @@ from src.text.utils import Annotator
 from src.text.llm import LLMOrchestrator, LLMResultHandler
 from src.utils.utils import Cleaner, Watcher
 from src.db.manager import Database
-from watchdog.events import FileSystemEventHandler
-import asyncio
-from watchdog.observers.polling import PollingObserver
+from src.pipeline import AsyncPipeline, MultiCallProcessor
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("main")
 
 
-async def main(audio_file_path: str):
+async def process_async(audio_file_path: str):
     """
-    Process an audio file to perform diarization, transcription, punctuation restoration,
-    and speaker role classification.
-
+    Process an audio file using the asynchronous pipeline.
+    
     Parameters
     ----------
     audio_file_path : str
-        The path to the input audio file to be processed.
-
-    Returns
-    -------
-    None
+        Path to the audio file to process
     """
-    # Paths
-    config_nemo = "config/nemo/diar_infer_telephonic.yaml"
-    manifest_path = ".temp/manifest.json"
-    temp_dir = ".temp"
-    rttm_file_path = os.path.join(temp_dir, "pred_rttms", "mono_file.rttm")
-    transcript_output_path = ".temp/output.txt"
-    srt_output_path = ".temp/output.srt"
-    config_path = "config/config.yaml"
-    prompt_path = "config/prompt.yaml"
-    db_path = ".db/Callytics.sqlite"
-    db_topic_fetch_path = "src/db/sql/TopicFetch.sql"
-    db_topic_insert_path = "src/db/sql/TopicInsert.sql"
-    db_audio_properties_insert_path = "src/db/sql/AudioPropertiesInsert.sql"
-    db_utterance_insert_path = "src/db/sql/UtteranceInsert.sql"
-
-    # Configuration
-    config = OmegaConf.load(config_path)
-    device = config.runtime.device
-    compute_type = config.runtime.compute_type
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = config.runtime.cuda_alloc_conf
-
-    # Initialize Classes
-    dialogue_detector = DialogueDetecting(delete_original=True)
-    enhancer = SpeechEnhancement(config_path=config_path, output_dir=temp_dir)
-    separator = DemucsVocalSeparator()
-    processor = AudioProcessor(audio_path=audio_file_path, temp_dir=temp_dir)
-    transcriber = Transcriber(device=device, compute_type=compute_type)
-    aligner = ForcedAligner(device=device)
-    llm_handler = LLMOrchestrator(config_path=config_path, prompt_config_path=prompt_path, model_id="openai")
-    llm_result_handler = LLMResultHandler()
-    cleaner = Cleaner()
-    formatter = Formatter()
-    db = Database(db_path)
-    audio_feature_extractor = Audio(audio_file_path)
-
-    # Step 1: Detect Dialogue
-    has_dialogue = dialogue_detector.process(audio_file_path)
-    if not has_dialogue:
-        return
-
-    # Step 2: Speech Enhancement
-    audio_path = enhancer.enhance_audio(
-        input_path=audio_file_path,
-        output_path=os.path.join(temp_dir, "enhanced.wav"),
-        noise_threshold=0.0001,
-        verbose=True
-    )
-
-    # Step 3: Vocal Separation
-    vocal_path = separator.separate_vocals(audio_file=audio_path, output_dir=temp_dir)
-
-    # Step 4: Transcription
-    transcript, info = transcriber.transcribe(audio_path=vocal_path)
-    detected_language = info["language"]
-
-    # Step 5: Forced Alignment
-    word_timestamps = aligner.align(
-        audio_path=vocal_path,
-        transcript=transcript,
-        language=detected_language
-    )
-
-    # Step 6: Diarization
-    processor.audio_path = vocal_path
-    mono_audio_path = processor.convert_to_mono()
-    processor.audio_path = mono_audio_path
-    processor.create_manifest(manifest_path)
-    cfg = OmegaConf.load(config_nemo)
-    cfg.diarizer.manifest_filepath = manifest_path
-    cfg.diarizer.out_dir = temp_dir
-    msdd_model = NeuralDiarizer(cfg=cfg)
-    msdd_model.diarize()
-
-    # Step 7: Processing Transcript
-    # Step 7.1: Speaker Timestamps
-    speaker_reader = SpeakerTimestampReader(rttm_path=rttm_file_path)
-    speaker_ts = speaker_reader.read_speaker_timestamps()
-
-    # Step 7.2: Mapping Words
-    word_speaker_mapper = WordSpeakerMapper(word_timestamps, speaker_ts)
-    wsm = word_speaker_mapper.get_words_speaker_mapping()
-
-    # Step 7.3: Punctuation Restoration
-    punct_restorer = PunctuationRestorer(language=detected_language)
-    wsm = punct_restorer.restore_punctuation(wsm)
-    word_speaker_mapper.word_speaker_mapping = wsm
-    word_speaker_mapper.realign_with_punctuation()
-    wsm = word_speaker_mapper.word_speaker_mapping
-
-    # Step 7.4: Mapping Sentences
-    sentence_mapper = SentenceSpeakerMapper()
-    ssm = sentence_mapper.get_sentences_speaker_mapping(wsm)
-
-    # Step 8 (Optional): Write Transcript and SRT Files
-    writer = TranscriptWriter()
-    writer.write_transcript(ssm, transcript_output_path)
-    writer.write_srt(ssm, srt_output_path)
-
-    # Step 9: Classify Speaker Roles
-    speaker_roles = await llm_handler.generate("Classification", ssm)
-
-    # Step 9.1: LLM results validate and fallback
-    ssm = llm_result_handler.validate_and_fallback(speaker_roles, ssm)
-    llm_result_handler.log_result(ssm, speaker_roles)
-
-    # Step 10: Sentiment Analysis
-    ssm_with_indices = formatter.add_indices_to_ssm(ssm)
-    annotator = Annotator(ssm_with_indices)
-    sentiment_results = await llm_handler.generate("SentimentAnalysis", user_input=ssm)
-    annotator.add_sentiment(sentiment_results)
-
-    # Step 11: Profanity Word Detection
-    profane_results = await llm_handler.generate("ProfanityWordDetection", user_input=ssm)
-    annotator.add_profanity(profane_results)
-
-    # Step 12: Summary
-    summary_result = await llm_handler.generate("Summary", user_input=ssm)
-    annotator.add_summary(summary_result)
-
-    # Step 13: Conflict Detection
-    conflict_result = await llm_handler.generate("ConflictDetection", user_input=ssm)
-    annotator.add_conflict(conflict_result)
-
-    # Step 14: Topic Detection
-    topics = db.fetch(db_topic_fetch_path)
-    topic_result = await llm_handler.generate(
-        "TopicDetection",
-        user_input=ssm,
-        system_input=topics
-    )
-    annotator.add_topic(topic_result)
-
-    #  Step 15: File/Audio Feature Extraction
-    props = audio_feature_extractor.properties()
-
-    (
-        name,
-        file_extension,
-        absolute_file_path,
-        sample_rate,
-        min_frequency,
-        max_frequency,
-        audio_bit_depth,
-        num_channels,
-        audio_duration,
-        rms_loudness,
-        final_features
-    ) = props
-
-    rms_loudness_db = final_features["RMSLoudness"]
-    zero_crossing_rate_db = final_features["ZeroCrossingRate"]
-    spectral_centroid_db = final_features["SpectralCentroid"]
-    eq_20_250_db = final_features["EQ_20_250_Hz"]
-    eq_250_2000_db = final_features["EQ_250_2000_Hz"]
-    eq_2000_6000_db = final_features["EQ_2000_6000_Hz"]
-    eq_6000_20000_db = final_features["EQ_6000_20000_Hz"]
-    mfcc_values = [final_features[f"MFCC_{i}"] for i in range(1, 14)]
-
-    final_output = annotator.finalize()
-
-    # Step 16: Tocal Silence Calculation
-    stats = SilenceStats.from_segments(final_output['ssm'])
-    t_std = stats.threshold_std(factor=0.99)
-    final_output["silence"] = t_std
-
-    print("Final_Output:", final_output)
-
-    # Step 17: Database
-    # Step 17.1: Insert File Table
-    summary = final_output.get("summary", "")
-    conflict_flag = 1 if final_output.get("conflict", False) else 0
-    silence_value = final_output.get("silence", 0.0)
-    detected_topic = final_output.get("topic", "Unknown")
-
-    topic_id = db.get_or_insert_topic_id(detected_topic, topics, db_topic_insert_path)
-
-    params = (
-        name,
-        topic_id,
-        file_extension,
-        absolute_file_path,
-        sample_rate,
-        min_frequency,
-        max_frequency,
-        audio_bit_depth,
-        num_channels,
-        audio_duration,
-        rms_loudness_db,
-        zero_crossing_rate_db,
-        spectral_centroid_db,
-        eq_20_250_db,
-        eq_250_2000_db,
-        eq_2000_6000_db,
-        eq_6000_20000_db,
-        *mfcc_values,
-        summary,
-        conflict_flag,
-        silence_value
-    )
-
-    last_id = db.insert(db_audio_properties_insert_path, params)
-    print(f"Audio properties inserted successfully into the File table with ID: {last_id}")
-
-    # Step 17.2: Insert Utterance Table
-    utterances = final_output["ssm"]
-
-    for utterance in utterances:
-        file_id = last_id
-        speaker = utterance["speaker"]
-        sequence = utterance["index"]
-        start_time = utterance["start_time"] / 1000.0
-        end_time = utterance["end_time"] / 1000.0
-        content = utterance["text"]
-        sentiment = utterance["sentiment"]
-        profane = 1 if utterance["profane"] else 0
-
-        utterance_params = (
-            file_id,
-            speaker,
-            sequence,
-            start_time,
-            end_time,
-            content,
-            sentiment,
-            profane
-        )
-
-        db.insert(db_utterance_insert_path, utterance_params)
-
-    print("Utterances inserted successfully into the Utterance table.")
-
-    # Step 18: Clean Up
-    cleaner.cleanup(temp_dir, audio_file_path)
+    try:
+        logger.info(f"Processing file: {audio_file_path}")
+        pipeline = AsyncPipeline()
+        
+        # Process the audio file
+        result = await pipeline.process(audio_file_path)
+        
+        # Clean up resources
+        await pipeline.cleanup()
+        
+        logger.info(f"Completed processing: {audio_file_path}")
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error processing {audio_file_path}: {e}")
+        return None
 
 
-async def process(path: str):
+async def process_batch_async(audio_file_paths: List[str], max_concurrent: int = 3):
     """
-    Asynchronous callback function that is triggered when a new audio file is detected.
-
+    Process multiple audio files concurrently.
+    
     Parameters
     ----------
-    path : str
-        The path to the newly created audio file.
-
-    Returns
-    -------
-    None
+    audio_file_paths : List[str]
+        List of paths to audio files
+    max_concurrent : int
+        Maximum number of files to process concurrently
     """
-    print(f"Processing new audio file: {path}")
-    await main(path)
+    processor = MultiCallProcessor(max_concurrent=max_concurrent)
+    results = await processor.process_batch(audio_file_paths)
+    logger.info(f"Completed batch processing of {len(audio_file_paths)} files")
+    return results
+
+
+def process(audio_file_path: str):
+    """
+    Synchronous wrapper for processing a single audio file.
+    
+    Parameters
+    ----------
+    audio_file_path : str
+        Path to the audio file to process
+    """
+    return asyncio.run(process_async(audio_file_path))
+
+
+def process_batch(audio_file_paths: List[str], max_concurrent: int = 3):
+    """
+    Synchronous wrapper for processing multiple audio files.
+    
+    Parameters
+    ----------
+    audio_file_paths : List[str]
+        List of paths to audio files
+    max_concurrent : int
+        Maximum number of files to process concurrently
+    """
+    return asyncio.run(process_batch_async(audio_file_paths, max_concurrent))
+
+
+class FileHandler(FileSystemEventHandler):
+    """
+    Watchdog handler for processing new audio files.
+    
+    This handler detects when new audio files are added to a
+    directory and processes them automatically.
+    """
+    
+    def __init__(self, callback):
+        """
+        Initialize the file handler.
+        
+        Parameters
+        ----------
+        callback : callable
+            Function to call when a new file is detected
+        """
+        self.callback = callback
+        self.extensions = {".wav", ".mp3", ".ogg", ".flac", ".m4a"}
+    
+    def on_created(self, event):
+        """React to file creation events."""
+        if not event.is_directory and self._is_audio_file(event.src_path):
+            logger.info(f"New audio file detected: {event.src_path}")
+            self.callback(event.src_path)
+    
+    def on_moved(self, event):
+        """React to file move events."""
+        if not event.is_directory and self._is_audio_file(event.dest_path):
+            logger.info(f"Audio file moved to: {event.dest_path}")
+            self.callback(event.dest_path)
+    
+    def _is_audio_file(self, path):
+        """Check if the file is an audio file based on extension."""
+        ext = os.path.splitext(path)[1].lower()
+        return ext in self.extensions
+
+
+def watch_directory(directory_path: str):
+    """
+    Watch a directory for new audio files and process them.
+    
+    Parameters
+    ----------
+    directory_path : str
+        Path to the directory to watch
+    """
+    logger.info(f"Starting directory watch on: {directory_path}")
+    
+    # Create observer
+    observer = PollingObserver()
+    handler = FileHandler(process)
+    observer.schedule(handler, directory_path, recursive=False)
+    observer.start()
+    
+    try:
+        while True:
+            asyncio.run(asyncio.sleep(1))
+    except KeyboardInterrupt:
+        observer.stop()
+    
+    observer.join()
+
+
+def cleanup_temp():
+    """Clean up temporary files."""
+    cleaner = Cleaner()
+    temp_dir = ".temp"
+    if os.path.exists(temp_dir):
+        cleaner.clean_directory(temp_dir)
 
 
 if __name__ == "__main__":
-    # 1) 감시할 디렉터리 절대경로 계산 & 생성
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    watch_dir = os.path.join(BASE_DIR, ".data", "input")
-    os.makedirs(watch_dir, exist_ok=True)
-    print(f"→ Watching for new files in: {watch_dir}")
-
-    # 2) 파일 생성·이동 이벤트 처리 핸들러
-    class FileHandler(FileSystemEventHandler):
-        def __init__(self, callback):
-            super().__init__()
-            self.callback = callback
-
-        def on_created(self, event):
-            if not event.is_directory:
-                print(f"[Watcher] created: {event.src_path}")
-                asyncio.run(self.callback(event.src_path))
-
-        def on_moved(self, event):
-            if not event.is_directory:
-                print(f"[Watcher] moved: {event.dest_path}")
-                asyncio.run(self.callback(event.dest_path))
-
-    # 3) Observer 설정 및 실행
-    observer = PollingObserver()
-    observer.schedule(FileHandler(process), watch_dir, recursive=False)
-    observer.start()
-    try:
-        import time
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        observer.stop()
-    observer.join()
+    parser = argparse.ArgumentParser(description="Audio processing pipeline")
+    
+    # Create subparsers for different modes
+    subparsers = parser.add_subparsers(dest="mode", help="Operation mode")
+    
+    # Parser for processing a single file
+    file_parser = subparsers.add_parser("file", help="Process a single audio file")
+    file_parser.add_argument("path", type=str, help="Path to the audio file")
+    
+    # Parser for processing multiple files
+    batch_parser = subparsers.add_parser("batch", help="Process multiple audio files")
+    batch_parser.add_argument("paths", type=str, nargs="+", help="Paths to audio files")
+    batch_parser.add_argument("--max-concurrent", type=int, default=3, 
+                             help="Maximum number of files to process concurrently")
+    
+    # Parser for watching a directory
+    watch_parser = subparsers.add_parser("watch", help="Watch a directory for new audio files")
+    watch_parser.add_argument("directory", type=str, help="Directory to watch")
+    
+    # Parser for cleaning temporary files
+    cleanup_parser = subparsers.add_parser("cleanup", help="Clean up temporary files")
+    
+    # Parse arguments
+    args = parser.parse_args()
+    
+    # Clean up any existing temporary files
+    cleanup_temp()
+    
+    # Execute the appropriate function based on the mode
+    if args.mode == "file":
+        process(args.path)
+    elif args.mode == "batch":
+        process_batch(args.paths, args.max_concurrent)
+    elif args.mode == "watch":
+        watch_directory(args.directory)
+    elif args.mode == "cleanup":
+        cleanup_temp()
+    else:
+        parser.print_help()
